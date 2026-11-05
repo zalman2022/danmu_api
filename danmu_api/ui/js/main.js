@@ -8,7 +8,7 @@ function createCustomAlert() {
     }
 
     // 创建弹窗HTML元素
-    const alertHTML = '<div class="modal" id="custom-alert-overlay"><div class="modal-content" id="custom-alert-content"><div class="modal-header"><h3 id="custom-alert-title">提示</h3><button class="close-btn" id="custom-alert-close">&times;</button></div><div class="modal-body"><p id="custom-alert-message"></p></div><div class="modal-footer"><button class="btn btn-primary" id="custom-alert-confirm">确定</button></div></div></div>';
+    const alertHTML = '<div class="modal" id="custom-alert-overlay"><div class="modal-content" id="custom-alert-content"><div class="modal-header"><h3 id="custom-alert-title">提示</h3><button class="close-btn" id="custom-alert-close">&times;</button></div><div class="modal-body"><p id="custom-alert-message" style="word-break: break-all; white-space: pre-line;"></p></div><div class="modal-footer"><button class="btn btn-primary" id="custom-alert-confirm">确定</button></div></div></div>';
 
     // 添加到body
     document.body.insertAdjacentHTML('beforeend', alertHTML);
@@ -49,7 +49,7 @@ function customAlert(message, title = '提示') {
 
     // 设置标题和消息
     titleElement.textContent = title;
-    messageElement.textContent = message;
+    messageElement.textContent = message; // 使用 textContent 避免 message 中的 HTML 被解析执行；换行由元素 CSS white-space: pre-line 渲染
 
     // 显示弹窗
     overlay.classList.add('active');
@@ -106,7 +106,11 @@ document.addEventListener('DOMContentLoaded', createCustomAlert);
 // 数据存储
 let envVariables = {};
 let currentCategory = 'api'; // 默认分类改为api
+let envSearchQuery = '';
 let editingKey = null;
+let editingCategory = null;
+let editingKeyName = '';
+let editingType = 'text';
 let logs = []; // 保留本地日志数组，用于UI显示
 
 // 版本信息
@@ -175,12 +179,31 @@ function loadEnvVariables() {
         .then(config => {
             // 从配置中获取admin token
             currentAdminToken = config.originalEnvVars?.ADMIN_TOKEN || '';
+            updateLocalDanmuPermission(config);
 
             originalToken = config.originalEnvVars?.TOKEN || '';
             
             // 使用从API获取的原始环境变量，用于系统设置
             const originalEnvVars = config.originalEnvVars || {};
-            
+            // 浏览器偏好覆盖部署环境变量；云函数更新变量通常要等重新部署后才会进入新实例。
+            applyTheme(getStoredTheme() || originalEnvVars.UI_THEME || document.body.dataset.theme || 'lavender');
+            // 恢复独立的深浅色偏好：已存储 > 系统偏好 > 默认浅色
+            if (!document.body.dataset.colorScheme) {
+                var scheme = getStoredColorScheme();
+                if (!scheme) {
+                    scheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                }
+                document.body.dataset.colorScheme = scheme;
+                document.documentElement.dataset.colorScheme = scheme;
+            }
+            updateColorSchemeToggle();
+            // 用户未手动选择时，跟随系统深浅色变更
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function (e) {
+                if (!getStoredColorScheme()) {
+                    transitionToColorScheme(e.matches ? 'dark' : 'light', false);
+                }
+            });
+
             // 重新组织数据结构以适配现有UI
             envVariables = {};
             
@@ -204,7 +227,8 @@ function loadEnvVariables() {
                     type: varConfig.type || 'text',
                     min: varConfig.min,
                     max: varConfig.max,
-                    options: varConfig.options || [] // 仅对 select 和 multi-select 类型有效
+                    options: varConfig.options || [], // 仅对 select 和 multi-select 类型有效
+                    sources: varConfig.sources || null // 仅对 DANMU_OFFSET 等需要来源配置的有效
                 });
             });
             
@@ -363,8 +387,14 @@ function getDockerVersion() {
 
 // 切换导航
 function switchSection(section, event = null) {
-    // 检查是否尝试访问受token保护的section（日志查看、接口调试、系统配置需要token访问）
-    if (section === 'logs' || section === 'api' || section === 'env' || section === 'push') {
+    // 点击已激活的"配置预览"时返回总览
+    if (section === 'preview' && document.getElementById('preview-section').classList.contains('active')) {
+        if (typeof resetToPreviewOverview === 'function') resetToPreviewOverview();
+        return;
+    }
+
+    // 检查是否尝试访问受token保护的section（日志查看、接口调试、推送弹幕、请求记录、系统配置需要token访问）
+    if (section === 'logs' || section === 'api' || section === 'env' || section === 'push' || section === 'request-records' || section === 'local-danmu') {
         let _reverseProxy = customBaseUrl; // 使用全局配置
 
         // 获取URL路径并提取token
@@ -443,7 +473,7 @@ function switchSection(section, event = null) {
                         event.target.classList.add('active');
                     }
 
-                    addLog(\`切换到\${section === 'env' ? '环境变量' : section === 'preview' ? '配置预览' : section === 'logs' ? '日志查看' : section === 'push' ? '推送弹幕' : '接口调试'}模块\`, 'info');
+                    addLog(\`切换到\${section === 'env' ? '环境变量' : section === 'preview' ? '配置预览' : section === 'logs' ? '日志查看' : section === 'push' ? '推送弹幕' : section === 'request-records' ? '请求记录' : '接口调试'}模块\`, 'info');
                 }
             });
         } else {
@@ -456,7 +486,7 @@ function switchSection(section, event = null) {
                 event.target.classList.add('active');
             }
 
-            addLog(\`切换到\${section === 'env' ? '环境变量' : section === 'preview' ? '配置预览' : section === 'logs' ? '日志查看' : section === 'push' ? '推送弹幕' : '接口调试'}模块\`, 'info');
+            addLog(\`切换到\${section === 'env' ? '环境变量' : section === 'preview' ? '配置预览' : section === 'logs' ? '日志查看' : section === 'push' ? '推送弹幕' : section === 'request-records' ? '请求记录' : '接口调试'}模块\`, 'info');
             
             // 如果切换到日志查看页面，则立即刷新日志
             if (section === 'logs') {
@@ -480,24 +510,53 @@ function switchSection(section, event = null) {
 }
 
 // 切换类别
-function switchCategory(category, event = null) {
+function switchCategory(category) {
     currentCategory = category;
-    document.querySelectorAll('.category-btn').forEach(b => b.classList.remove('active'));
-    if (event && event.target) {
-        event.target.classList.add('active');
-    }
+    clearEnvSearch(false);
     renderEnvList();
+}
+
+let modalPageScrollTop = 0;
+
+function lockPageScroll() {
+    if (document.body.classList.contains('modal-open')) {
+        return;
+    }
+
+    modalPageScrollTop = window.scrollY || document.documentElement.scrollTop;
+    document.documentElement.classList.add('modal-open');
+    document.body.classList.add('modal-open');
+    document.body.style.top = '-' + modalPageScrollTop + 'px';
+}
+
+function unlockPageScroll() {
+    if (!document.body.classList.contains('modal-open')) {
+        return;
+    }
+
+    document.documentElement.classList.remove('modal-open');
+    document.body.classList.remove('modal-open');
+    document.body.style.top = '';
+    window.scrollTo(0, modalPageScrollTop);
 }
 
 // 关闭模态框
 function closeModal() {
-    document.getElementById('env-modal').classList.remove('active');
-    
+    if (typeof cleanupSelectedTagsTouchDrag === 'function') cleanupSelectedTagsTouchDrag();
+    if (typeof handleStagingTouchCancel === 'function') handleStagingTouchCancel();
+
+    var modal = document.getElementById('env-modal');
+    modal.classList.add('closing');
+    setTimeout(function() {
+        modal.classList.remove('active');
+        modal.classList.remove('closing');
+        unlockPageScroll();
+    }, 220);
+    editingKey = null;
+    editingCategory = null;
     // 重置表单字段状态
-    document.getElementById('env-category').disabled = false;
-    document.getElementById('env-key').readOnly = false;
-    document.getElementById('value-type').disabled = false;
-    document.getElementById('env-description').readOnly = false;
+    editingKeyName = '';
+    editingType = 'text';
 }
 
 // 页面加载完成后初始化时获取一次日志
@@ -551,33 +610,264 @@ async function init() {
 
 // 复制API端点到剪贴板
 function copyApiEndpoint() {
-    const apiEndpointElement = document.getElementById('api-endpoint');
-    if (apiEndpointElement) {
-        const apiEndpoint = apiEndpointElement.textContent;
-        navigator.clipboard.writeText(apiEndpoint)
-            .then(() => {
-                // 临时改变显示文本以提供反馈
-                const originalText = apiEndpointElement.textContent;
-                apiEndpointElement.textContent = '已复制!';
-                apiEndpointElement.style.color = '#ff6b6b';
-                
-                // 2秒后恢复原始文本
-                setTimeout(() => {
-                    apiEndpointElement.textContent = originalText;
-                    apiEndpointElement.style.color = '#4CAF50';
-                }, 2000);
-                
-                addLog('API端点已复制到剪贴板: ' + apiEndpoint, 'success');
-            })
-            .catch(err => {
-                console.error('复制失败:', err);
-                customAlert('复制失败: ' + err);
-                addLog('复制API端点失败: ' + err, 'error');
-            });
+    var apiEndpointElement = document.getElementById('api-endpoint');
+    if (!apiEndpointElement) return;
+    var apiEndpoint = apiEndpointElement.textContent.trim();
+    if (!apiEndpoint || apiEndpoint === '加载中...') return;
+
+    var done = function() {
+        var originalText = apiEndpointElement.textContent;
+        apiEndpointElement.textContent = '已复制!';
+        apiEndpointElement.style.color = '#ff6b6b';
+        setTimeout(function() {
+            apiEndpointElement.textContent = originalText;
+            apiEndpointElement.style.color = '#4CAF50';
+        }, 2000);
+        addLog('API端点已复制到剪贴板: ' + apiEndpoint, 'success');
+    };
+
+    // 主方案：Clipboard API (需 HTTPS)
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(apiEndpoint).then(done).catch(function(err) {
+            // HTTPS 下仍失败则使用备用方案
+            fallbackCopy(apiEndpoint, done);
+        });
+    } else {
+        // HTTP 环境下的备用方案
+        fallbackCopy(apiEndpoint, done);
     }
+}
+
+function fallbackCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '-9999px';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try {
+        document.execCommand('copy');
+        if (done) done();
+    } catch(e) {
+        customAlert('复制失败，请手动复制：' + text);
+    }
+    document.body.removeChild(ta);
+}
+
+function escapeHtml(text) {
+    // 如果是 null 或 undefined，返回空字符串
+    if (text === null || text === undefined) {
+        return '';
+    }
+    
+    // 将非字符串值转换为字符串
+    const str = String(text);
+    
+    const map = {
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#039;'
+    };
+    return str.replace(/[&<>"']/g, m => map[m]);
 }
 
 
 // 页面加载完成后初始化
 init();
+
+// 明暗模式切换
+function toggleColorScheme() {
+    const currentScheme = document.body.dataset.colorScheme || 'light';
+    transitionToColorScheme(currentScheme === 'dark' ? 'light' : 'dark');
+}
+
+/** 开关做法：先放大，等放大过渡结束再截取快照，过渡结束后缩小（时长与样式表的 transform 过渡一致） */
+const SCHEME_SWITCH_SCALE_MS = 220;
+
+/**
+ * 以开关为圆心展开圆形裁剪，把页面过渡到指定明暗模式
+ * @param {string} scheme - 目标模式（light / dark）
+ * @param {boolean} persist - 是否保存为手动偏好；跟随系统时传入 false
+ */
+let isSchemeSwitching = false;
+
+function transitionToColorScheme(scheme, persist = true) {
+    const btn = document.getElementById('theme-scheme-toggle');
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!document.startViewTransition || !btn || reducedMotion) {
+        applyColorScheme(scheme, persist);
+        return;
+    }
+    // 上一次切换未结束时忽略新请求，避免两个视图过渡几乎同时启动
+    if (isSchemeSwitching) return;
+    isSchemeSwitching = true;
+    btn.classList.add('is-scheme-switching');
+    setTimeout(function () { runSchemeTransition(scheme, persist, btn); }, SCHEME_SWITCH_SCALE_MS);
+}
+
+/**
+ * 执行圆形裁剪过渡，结束后把开关恢复原尺寸
+ * @param {string} scheme - 目标模式（light / dark）
+ * @param {boolean} persist - 是否保存为手动偏好
+ * @param {HTMLElement} btn - 明暗开关按钮
+ */
+function runSchemeTransition(scheme, persist, btn) {
+    // 以开关中心为圆心、到最远角的距离为半径展开圆形裁剪
+    const rect = btn.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const radius = Math.hypot(
+        Math.max(centerX, window.innerWidth - centerX),
+        Math.max(centerY, window.innerHeight - centerY),
+    );
+    let transition;
+    try {
+        transition = document.startViewTransition(function () { applyColorScheme(scheme, persist); });
+    } catch (error) {
+        // 视图过渡未能启动时直接应用主题，并解除占用，避免后续切换一直被忽略
+        applyColorScheme(scheme, persist);
+        finishSchemeSwitch(btn);
+        return;
+    }
+    transition.ready.then(function () {
+        document.documentElement.animate(
+            {
+                clipPath: [
+                    'circle(0px at ' + centerX + 'px ' + centerY + 'px)',
+                    'circle(' + radius + 'px at ' + centerX + 'px ' + centerY + 'px)',
+                ],
+            },
+            { duration: 600, easing: 'ease-out', pseudoElement: '::view-transition-new(root)' },
+        );
+    }).catch(function () { /* 过渡被中断时无需处理，主题已应用 */ });
+    transition.finished.finally(function () { finishSchemeSwitch(btn); });
+}
+
+/**
+ * 结束一次切换：恢复开关尺寸并解除占用
+ * @param {HTMLElement} btn - 明暗开关按钮
+ */
+function finishSchemeSwitch(btn) {
+    btn.classList.remove('is-scheme-switching');
+    isSchemeSwitching = false;
+}
+
+// ===== 明暗模式切换 =====
+
+/** 应用明暗模式；切换期间关闭元素自身的颜色过渡，避免视图快照捕获中间态。persist 为 false 时不写入手动偏好 */
+function applyColorScheme(scheme, persist = true) {
+    const root = document.documentElement;
+    root.classList.add('theme-switching');
+    document.body.dataset.colorScheme = scheme;
+    root.dataset.colorScheme = scheme;
+    if (persist) storeColorScheme(scheme);
+    updateColorSchemeToggle();
+    requestAnimationFrame(function () { root.classList.remove('theme-switching'); });
+}
+
+function updateColorSchemeToggle() {
+    const btn = document.getElementById('theme-scheme-toggle');
+    if (!btn) return;
+    const scheme = document.body.dataset.colorScheme || 'light';
+    btn.title = scheme === 'dark' ? '切换浅色模式' : '切换暗色模式';
+    btn.setAttribute('aria-pressed', String(scheme === 'dark'));
+}
+
+// ===== 背景弹幕词库 =====
+const DANMAKU_DICT = [
+    // 常规流行语等
+    '弹幕', 'Danmaku', 'Bullet Chat', 'Barrage', 'Comment', 'コメント', 'バレットチャット', '幕弹', '弹幕引擎运行中', '彈幕 API 已就绪', '弹幕陪你看', '有弹幕才有氛围~', '弹幕即正义', '请合理使用', '公益服务请适当调高缓存避免滥用', '感谢大佬', 'PR 欢迎', 'Star 一下', 'LogVar', 'LogVar可能会倒闭但绝对不会变质', '(≧▽≦)', '(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧', 'Σ(°△°|||)︴', '٩(◕‿◕｡)۶', '—=≡Σ((( つ•̀ω•́)つ', '✨', '⭐', '🌸', '🎬', '💫', '📺', '🔥', '🚀', '抢沙发', '前排出售瓜子矿泉水', '潜水出来冒个泡', '酱紫啊', '太有才了', '膜拜大神', '火钳刘明', '神马都是浮云', '给力', '不管你信不信，反正我是信了', '矮油~', '哎哟，不错哦', '元芳，你怎么看', '233333', '666', '不明觉厉', '喜大普奔', '我和我的小伙伴们都惊呆了', '野生字幕君', '开口跪', '镇站之宝', '教练我想打篮球', '经费在燃烧', '你指尖跃动的电光', '是我此生不灭的信仰', '颜表立', '此生无悔入东方，来世愿生幻想乡', '梦が始まる', '战斗力只有5的渣渣', '马猴烧酒', '前方高能', '高能预警', '空降成功', '进度条保命', '战歌起', '正片开始', '名场面', '泪目', '见证历史', '撒花🎉', '完结撒花', '喵~', '这也在你的计算之中吗', '恭喜你发现宝藏', '囍', 'av170001', '真实', '下次一定', '你币有了', 'awsl', '注入灵魂', '神仙打架', '草(一种植物)', '不愧是你', '好耶', '爷青回', '芜湖', '血压起来了', 'DNA动了', '绷不住了', '绝绝子', '破防了', '优雅永不过时', '电子榨菜', '哈基米', '啊？', '命运的齿轮开始转动', '尊嘟假嘟', '硬控', '情绪价值', '电子布洛芬', 'city不city', '小孩哥', '小孩姐', 'Next Level', '上大分', '天命人', '广智救我', '接', '致敬', '何意味', '人生易如反掌', '淡人', '听劝', '真是一 pair 苦命鸳鸯啊', '谷子', '爱你老己', '生命力', '活人感', '敬自己一杯', '超绝松弛感', '顶级理解', '我的身材很曼妙', '是啊，吃什么', '恭喜爹可以称帝了！', '夯爆了', '班味消除', '中国人能飞', '中国人会飞', '牛来',
+    // TG 管理员与活跃人员
+    '鸽子', '豆佬', '@一路走来', '@摆烂 10','@𝒏𝒆𝒌𝒐', '@sleep', '@Aurora', '@🐳𝔀𝓭𝓷𝓶𝓵𝓰𝓫𝓭', '@mask','@我勒个豆儿', '@从', '@比企谷 雪乃', '@水东', '@一只歌鸽子(半夜看到我叫我滚去睡觉', '@狗剩', '@马牛逼',
+    // github 贡献者
+    '@huangxd-', '@wan0ge', '@woleigedouer', '@Wo254992', '@lilixu3','@Celestials316', '@dyphire', '@piaoyizy', '@xiaoQQya', '@liixing','@goodcommunication', '@Mr-Quin', '@chason-zhao', '@DemoJameson','@rinnein', '@Lampon', '@zcw199604', '@Mashiro000', '@wade6716','@xlmc', '@mz289', '@sugarbliss', '@Backsoon0', '@ynsen', '@karasushin', '@desmond9527',
+];
+
+// 背景弹幕发射间隔 0.5~1.5s
+const DANMAKU_INTERVAL_MS = 500;
+
+// ===== 背景弹幕系统 =====
+(function initBgDanmaku() {
+    const colors = [
+        '#f09199', '#00a2ff', '#8cb48c', '#39c5bb',
+        '#e9485e', '#a682e6', '#f78c50', '#6B8AFF',
+        '#ffb74d', '#ce93d8', '#80cbc4',
+    ];
+    const container = document.createElement('div');
+    container.id = 'bg-danmaku-layer';
+    container.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:-1;';
+    document.body.appendChild(container);
+
+    let running = true;
+    let timer = null;
+
+    function spawn() {
+        if (!running) return;
+        const text = DANMAKU_DICT[Math.floor(Math.random() * DANMAKU_DICT.length)];
+        const el = document.createElement('span');
+        const top = 3 + Math.random() * 94;
+        const duration = 16 + Math.random() * 22;
+        const size = 14 + Math.random() * 14;
+        const delay = Math.random() * 5;
+        const color = colors[Math.floor(Math.random() * colors.length)];
+        const opacity = 0.24 + Math.random() * 0.16;
+        el.textContent = text;
+        el.style.cssText = [
+            'position:absolute','white-space:nowrap',
+            'top:' + top + '%','left:100%',
+            'font-size:' + size + 'px','font-weight:600',
+            'color:' + color,'opacity:' + opacity.toFixed(2),
+            'pointer-events:none','user-select:none',
+            'text-shadow:0 0 2px rgba(0,0,0,0.08), 0 0 6px currentColor',
+            'animation:danmakuScroll2 ' + duration + 's linear ' + delay + 's',
+            'animation-fill-mode:backwards',
+        ].join(';');
+        container.appendChild(el);
+        el.addEventListener('animationend', () => el.remove());
+    }
+
+    function tick() {
+        spawn();
+        timer = setTimeout(tick, DANMAKU_INTERVAL_MS + Math.random() * DANMAKU_INTERVAL_MS * 2);
+    }
+
+    tick();
+
+    window._bgDanmaku = {
+        stop: function() { running = false; clearTimeout(timer); container.innerHTML = ''; },
+        start: function() { running = true; tick(); },
+    };
+})();
+
+// header 浮动点缀文字
+(function initHeaderDanmaku() {
+    const header = document.querySelector('.header');
+    if (!header) return;
+
+    const floatColors = [
+        'var(--theme-muted)', 'var(--theme-muted)',
+        '#f09199', '#00a2ff', '#8cb48c', '#39c5bb',
+        '#a682e6', '#f78c50', '#6B8AFF', '#ffb74d', '#ce93d8',
+    ];
+
+    function spawnHeaderFloat() {
+        const el = document.createElement('span');
+        el.className = 'header-danmaku-item';
+        el.textContent = DANMAKU_DICT[Math.floor(Math.random() * DANMAKU_DICT.length)];
+        const top = 4 + Math.random() * (header.offsetHeight - 22);
+        el.style.top = top + 'px';
+        el.style.fontSize = (11 + Math.random() * 5) + 'px';
+        el.style.color = floatColors[Math.floor(Math.random() * floatColors.length)];
+        el.style.animationDuration = (10 + Math.random() * 12) + 's';
+        header.appendChild(el);
+        el.addEventListener('animationend', function() { el.remove(); });
+    }
+
+    setInterval(spawnHeaderFloat, DANMAKU_INTERVAL_MS + Math.random() * DANMAKU_INTERVAL_MS * 2);
+    spawnHeaderFloat();
+})();
 `;

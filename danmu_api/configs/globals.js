@@ -13,9 +13,9 @@ export const Globals = {
   accessedEnvVars: {},
 
   // 静态常量
-  VERSION: '1.13.0',
-  MAX_LOGS: 500, // 日志存储，最多保存 500 行
-  MAX_ANIMES: 100,
+  VERSION: '1.21.8',
+  MAX_LOGS: 1000, // 日志存储，最多保存 1000 行
+  MAX_RECORDS: 100, // 请求记录最大数量
 
   // 运行时状态
   animes: [],
@@ -25,17 +25,25 @@ export const Globals = {
   requestHistory: new Map(), // 记录每个 IP 地址的请求历史
   localCacheValid: false, // 本地缓存是否生效
   localCacheInitialized: false, // 本地缓存是否已初始化
+  localRedisCacheInitialized: false, // 本地 Redis 缓存是否已初始化
+  queryCacheInitialized: false, // 查询数据只恢复一次，之后以内存为准
+  queryCacheWritable: {}, // 后端成功读取后才可写入；失败后本进程保留远端数据
+  favoriteCacheWritable: {}, // 收藏读取失败时保护原快照，与查询恢复状态独立
   redisValid: false, // redis是否生效
+  localRedisValid: false, // 本地redis是否生效
+  aiValid: false, // AI配置是否生效
   redisCacheInitialized: false, // redis 缓存是否已初始化
   lastSelectMap: new Map(), // 存储查询关键字上次选择的animeId，用于下次match自动匹配时优先选择该anime
-  lastHashes: { // 存储上一次各变量哈希值
-    animes: null,
-    episodeIds: null,
-    episodeNum: null,
-    lastSelectMap: null
-  },
+  reqRecords: [], // 记录请求历史，包括接口/参数/请求时间
+  todayReqNum: 0, // 今日请求数量统计
+  // 各后端只记录自身已确认持有的数据；缺少哈希表示尚未持久化。
+  localFileHashes: {},
+  upstashHashes: {},
+  localRedisHashes: {},
   searchCache: new Map(), // 搜索结果缓存，存储格式：{ keyword: { results, timestamp } }
   commentCache: new Map(), // 弹幕缓存，存储格式：{ videoUrl: { comments, timestamp } }
+  favoriteCache: new Map(), // 收藏剧集永久缓存，存储格式：{ keyword: { results, details, timestamp } }，无 TTL、无数量上限
+  remoteTitleMappingTable: new Map(), // 远端剧名映射，查询时由本机映射优先兜底
   deployPlatform: '', // 部署平台配置
   currentToken: '', // 标识当前可用token
 
@@ -99,9 +107,15 @@ export const Globals = {
       } else if (conf.startsWith('bilibili@') && hostname.includes('bilibili')) {
          specificProxy = conf.substring(9);
          break;
+      } else if (conf.startsWith('animeko@') && (hostname.includes('animeko') || hostname.includes('bgm.tv'))) {
+         specificProxy = conf.substring(8);
+         break;
+      } else if (conf.startsWith('aiyifan@') && /(^|\.)(tripdata\.app|yfsp\.tv)$/.test(hostname)) {
+         specificProxy = conf.substring(8);
+         break;
       } else if (conf.startsWith('@') && !universalProxy) {
          universalProxy = conf.substring(1);
-      } else if (!conf.includes('@') && !forwardProxy) {
+      } else if (/^https?:\/\//i.test(conf) && !forwardProxy) {
          forwardProxy = conf;
       }
     }
@@ -137,18 +151,27 @@ export const Globals = {
     return targetUrl;
   },
 
+  resolveTitleMapping(title) {
+    const key = String(title ?? '');
+    const localMappings = this.envs?.titleMappingTable;
+    if (localMappings?.has(key)) return localMappings.get(key);
+    return this.remoteTitleMappingTable.get(key) ?? null;
+  },
+
   /**
    * 获取全局配置快照
    * @returns {Object} 当前全局配置
    */
   /**
    * 获取全局配置对象（单例，可修改）
+   * 使用 Proxy 保持接口兼容性，实例懒初始化后缓存复用避免每次新建
    * @returns {Object} 全局配置对象本身
    */
   getConfig() {
-    // 使用 Proxy 保持接口兼容性
+    if (this._configProxy) return this._configProxy;
+
     const self = this;
-    return new Proxy({}, {
+    this._configProxy = new Proxy({}, {
       get(target, prop) {
         // 优先返回 envs 中的属性（保持原有的平铺效果）
         if (prop in self.envs) {
@@ -157,7 +180,8 @@ export const Globals = {
         // 映射大写常量到小写
         if (prop === 'version') return self.VERSION;
         if (prop === 'maxLogs') return self.MAX_LOGS;
-        if (prop === 'maxAnimes') return self.MAX_ANIMES;
+        if (prop === 'maxAnimes') return self.envs.MAX_ANIMES;
+        if (prop === 'maxRecords') return self.MAX_RECORDS;
         if (prop === 'maxLastSelectMap') return self.MAX_LAST_SELECT_MAP;
 
         // 暴露方法
@@ -176,6 +200,8 @@ export const Globals = {
         return true;
       }
     });
+
+    return this._configProxy;
   },
 };
 

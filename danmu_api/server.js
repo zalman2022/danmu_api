@@ -1,23 +1,89 @@
-// server.js - 智能服务器启动器：根据 Node.js 环境自动选择最优启动模式
+import { createRequire } from 'module';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import http from 'http';
+import https from 'https';
+import zlib from 'zlib';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import dotenv from 'dotenv';
+import { Request as NodeFetchRequest } from 'node-fetch';
+import { handleRequest } from './worker.js';
+import { Globals, globals } from './configs/globals.js';
+import { Envs } from './configs/envs.js';
+import { clearBangumiDataCache, initBangumiData, syncBangumiDataLifecycleOnConfigChange } from './utils/bangumi-data-util.js';
+import { judgeRedisValid, initializePersistentCaches } from './utils/redis-util.js';
+import { persistFavorites, refreshFavoriteByKeyword } from './apis/favorite-api.js';
+import { startFavoriteScheduler, stopFavoriteScheduler } from './utils/favorite-schedule-util.js';
+import { formatHostForUrl, listenOnAllInterfaces } from './utils/server-listen-util.js';
+import { ensureRemoteTitleMapping } from './utils/remote-title-mapping-util.js';
 
-// 加载 .env 文件中的环境变量（本地开发时使用）
-const path = require('path');
-const fs = require('fs');
-const dotenv = require('dotenv');
+// 读取 Node HTTP 请求体的原始字节，避免多字节字符和上传文件在分块读取时被破坏。
+async function readRequestBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
 
-// 保存系统环境变量的副本，确保它们具有最高优先级
-const systemEnvBackup = { ...process.env };
+// =====================
+// server.js - 本地node智能启动脚本：根据 Node.js 环境自动选择最优启动模式
+// =====================
+
+// 导入 ES module 兼容层（始终加载，但内部会根据需要启用）
+import './esm-shim.cjs';
+
+// 预加载 node-fetch v3：仅在 Node < 20.19.0 等需兼容层的环境实际加载，其他环境为无操作；必须在首个请求前完成，否则 esm-shim 的 require 代理会拒绝同步取用
+if (typeof global.loadNodeFetch === 'function') {
+  await global.loadNodeFetch();
+}
+
+// 构建 CommonJS 环境下才有的全局变量
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
 
 // 配置文件路径在项目根目录（server.js 的上一级目录）
 const configDir = path.join(__dirname, '..', 'config');
 const configExampleDir = path.join(__dirname, '..', 'config_example');
 const envPath = path.join(configDir, '.env');
 
-//引入 zlib 模块，用于响应数据的 GZIP 压缩
-const zlib = require('zlib');
+// 保存系统环境变量的副本，确保它们具有最高优先级
+const systemEnvBackup = { ...process.env };
+
+// 注入到 Envs，供自定义规则变量读取时判定系统环境变量优先级（绕过 dotenv 注释截断）
+Envs.systemEnvBackup = systemEnvBackup;
+
+
+// 引入 zlib 模块，用于响应数据的 GZIP 压缩
+// (注：zlib 已在顶部 import，此处保留原版注释意图说明)
 
 // 在启动时检查并复制配置文件
 checkAndCopyConfigFiles();
+
+// 初始加载
+loadEnv();
+
+function detectNodeDeployPlatform() {
+  if (process.env.SPACE_ID) {
+    return "huggingface";
+  }
+  return "node";
+}
+
+function resolvePublicRequestProtocol(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (forwardedProto === 'http' || forwardedProto === 'https') {
+    return forwardedProto;
+  }
+
+  const configuredProto = String(process.env.DANMU_API_PUBLIC_PROTO || 'http')
+    .trim()
+    .toLowerCase();
+  return configuredProto === 'https' ? 'https' : 'http';
+}
 
 /**
  * 检查并自动复制配置文件
@@ -69,6 +135,10 @@ function checkAndCopyConfigFiles() {
   }
 }
 
+/**
+ * 加载环境变量
+ * 加载 .env 文件（低优先级），并在最后恢复系统环境变量的值以确保最高优先级
+ */
 function loadEnv() {
   try {
     // 加载 .env 文件（低优先级）
@@ -79,14 +149,20 @@ function loadEnv() {
       process.env[key] = value;
     }
 
+    // 解析 .env 原始内容，供支持自定义规则的变量绕过 dotenv 注释截断（保留 # 等字符）
+    try {
+      if (fs.existsSync(envPath)) {
+        Envs.rawEnvValues = Envs.parseRawEnvText(fs.readFileSync(envPath, 'utf8'));
+      }
+    } catch (e) {
+      // 原始解析失败不影响启动，相关变量回退到普通取值语义
+    }
+
     console.log('[server] .env file loaded successfully');
   } catch (e) {
     console.log('[server] dotenv not available or .env file not found, using system environment variables');
   }
 }
-
-// 初始加载
-loadEnv();
 
 // 监听 .env 文件变化（仅在文件存在时）
 let envWatcher = null;
@@ -94,7 +170,11 @@ let reloadTimer = null;
 let mainServer = null;
 let proxyServer = null;
 
-function setupEnvWatcher() {
+/**
+ * 设置 .env 文件监听器
+ * 实现配置文件的热重载功能
+ */
+async function setupEnvWatcher() {
   const envExists = fs.existsSync(envPath);
 
   if (!envExists) {
@@ -103,7 +183,9 @@ function setupEnvWatcher() {
   }
 
   try {
-    const chokidar = require('chokidar');
+    const chokidarModule = await import('chokidar');
+    const chokidar = chokidarModule.default || chokidarModule;
+
     const watchPaths = [];
     if (envExists) watchPaths.push(envPath);
 
@@ -154,11 +236,17 @@ function setupEnvWatcher() {
           }
 
           // 清除 dotenv 缓存并重新加载环境变量
-          delete require.cache[require.resolve('dotenv')];
           loadEnv();
 
           console.log('[server] Environment variables reloaded successfully');
           console.log('[server] Updated keys:', Array.from(newEnvKeys).join(', '));
+
+          // 配置变更后同步 Bangumi Data 生命周期：开启则立即确保缓存就绪（缺失则下载），
+          // 关闭则释放缓存；先按真实配置同步内存开关，避免重载未刷新 globals 时状态滞后
+          const bangumiEnabled = process.env.USE_BANGUMI_DATA === 'true' || process.env.USE_BANGUMI_DATA === true;
+          globals.useBangumiData = bangumiEnabled;
+          syncBangumiDataLifecycleOnConfigChange('node');
+
         } catch (error) {
           console.log('[server] Error reloading configuration files:', error.message);
         }
@@ -183,8 +271,11 @@ function setupEnvWatcher() {
   }
 }
 
-// 优雅关闭：清理文件监听器
-function cleanupWatcher() {
+/**
+ * 优雅关闭：清理文件监听器并关闭服务器
+ */
+function cleanupWatcher(exitCode = 0) {
+  stopFavoriteScheduler();
   if (envWatcher) {
     console.log('[server] Closing file watcher...');
     envWatcher.close();
@@ -195,14 +286,14 @@ function cleanupWatcher() {
     reloadTimer = null;
   }
   // 优雅关闭主服务器
-  if (mainServer) {
+  if (mainServer?.listening) {
     console.log('[server] Closing main server...');
     mainServer.close(() => {
       console.log('[server] Main server closed');
     });
   }
   // 优雅关闭代理服务器
-  if (proxyServer) {
+  if (proxyServer?.listening) {
     console.log('[server] Closing proxy server...');
     proxyServer.close(() => {
       console.log('[server] Proxy server closed');
@@ -211,82 +302,24 @@ function cleanupWatcher() {
   // 给服务器一点时间关闭后退出
   setTimeout(() => {
     console.log('[server] Exit complete.');
-    process.exit(0);
+    process.exit(exitCode);
   }, 500);
 }
 
 // 监听进程退出信号
-process.on('SIGTERM', cleanupWatcher);
-process.on('SIGINT', cleanupWatcher);
+process.on('SIGTERM', () => cleanupWatcher(0));
+process.on('SIGINT', () => cleanupWatcher(0));
 
-// 导入 ES module 兼容层（始终加载，但内部会根据需要启用）
-require('./esm-shim');
-
-const http = require('http');
-const https = require('https');
-const url = require('url');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-
-// --- 版本兼容性检测工具 ---
-// 辅助函数：比较两个版本号字符串
-function compareVersion(version1, version2) {
-  const v1Parts = version1.split('.').map(Number);
-  const v2Parts = version2.split('.').map(Number);
-
-  for (let i = 0; i < Math.max(v1Parts.length, v2Parts.length); i++) {
-    const v1Part = v1Parts[i] || 0;
-    const v2Part = v2Parts[i] || 0;
-
-    if (v1Part > v2Part) return 1;
-    if (v1Part < v2Part) return -1;
-  }
-
-  return 0;
-}
-
-// 检测是否需要异步启动（兼容层模式）
-function needsAsyncStartup() {
-  try {
-    const nodeVersion = process.versions.node;
-    // 检查 Node.js 版本是否 >= v20.19.0 (此版本及更高版本内置了 fetch API，对 node-fetch v3 的兼容性更好)
-    const isNodeCompatible = compareVersion(nodeVersion, '20.19.0') >= 0;
-
-    // 尝试检测已安装的 node-fetch 版本
-    const packagePath = require.resolve('node-fetch/package.json');
-    const pkg = require(packagePath);
-    // 检查 node-fetch 是否是 v3.x 版本 (v3.x 在旧版 Node.js 中可能存在一些加载问题)
-    const isNodeFetchV3 = pkg.version.startsWith('3.');
-
-    // 核心逻辑：只有在 Node.js < v20.19.0 且同时使用 node-fetch v3 时，才需要特殊的异步启动（兼容层模式）
-    const needsAsync = !isNodeCompatible && isNodeFetchV3;
-
-    console.log(`[server] Environment check: Node ${nodeVersion}, node-fetch ${pkg.version}`);
-    console.log(`[server] Node.js compatible (>=20.19.0): ${isNodeCompatible}`);
-    console.log(`[server] node-fetch v3: ${isNodeFetchV3}`);
-    console.log(`[server] Needs async startup: ${needsAsync}`);
-
-    return needsAsync;
-
-  } catch (e) {
-    // 无法检测或者 node-fetch 不存在，使用同步启动
-    console.log('[server] Cannot detect node-fetch, using sync startup');
-    return false;
-  }
-}
-
-// --- 核心 HTTP 服务器（端口 9321）逻辑 ---
-// 创建主业务服务器实例（将 Node.js 请求转换为 Web API Request，并调用 worker.js 处理）
+/**
+ * 创建主业务服务器实例 (默认端口 9321，可通过 DANMU_API_PORT 配置)
+ * 将 Node.js 请求转换为 Web API Request，并调用 worker.js 处理
+ */
 function createServer() {
-  // 导入所需的 fetch 兼容对象
-  const fetch = require('node-fetch');
-  const { Request, Response } = fetch;
-  // 导入核心请求处理逻辑
-  const { handleRequest } = require('./worker.js'); // 直接导入 handleRequest 函数
-
   return http.createServer(async (req, res) => {
     try {
-      // 构造完整的请求 URL
-      const fullUrl = `http://${req.headers.host}${req.url}`;
+      // 构造完整的请求 URL，反向代理场景优先使用客户端原始协议
+      const scheme = resolvePublicRequestProtocol(req);
+      const fullUrl = `${scheme}://${req.headers.host}${req.url}`;
 
       // 获取请求客户端的ip，兼容反向代理场景
       let clientIp = 'unknown';
@@ -301,7 +334,8 @@ function createServer() {
         clientIp = req.headers['x-real-ip'];
         console.log(`[server] Using X-Real-IP: ${clientIp}`);
       } else {
-        clientIp = req.connection.remoteAddress || 'unknown';
+        // req.connection 在新版 Node 已废弃，改用 req.socket
+        clientIp = req.socket.remoteAddress || 'unknown';
         console.log(`[server] Using direct connection IP: ${clientIp}`);
       }
       
@@ -312,62 +346,59 @@ function createServer() {
 
       // 异步读取 POST/PUT 请求的请求体
       let body;
-      if (req.method === 'POST' || req.method === 'PUT') {
-        body = await new Promise((resolve) => {
-          let data = '';
-          req.on('data', chunk => data += chunk);
-          req.on('end', () => resolve(data));
-        });
+      if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+        body = await readRequestBody(req);
       }
 
       // 创建一个 Web API 兼容的 Request 对象
-      const webRequest = new Request(fullUrl, {
+      const webRequest = new NodeFetchRequest(fullUrl, {
         method: req.method,
         headers: req.headers,
         body: body || undefined, // 对于 GET/HEAD 等请求，body 为 undefined
       });
 
-      // 调用核心处理函数，并标识平台为 "node"
-      const webResponse = await handleRequest(webRequest, process.env, "node", clientIp);
+      // 调用核心处理函数，并标识当前部署平台
+      const webResponse = await handleRequest(webRequest, process.env, detectNodeDeployPlatform(), clientIp);
 
       // 将 Web API Response 对象转换为 Node.js 响应
       res.statusCode = webResponse.status;
+      
       // 净化 Header：透传上游头信息，但强制移除传输相关字段 (Encoding/Length)
-            // (防止 Node.js 自动解压后，Header 仍残留 Gzip 标识导致客户端解析乱码)
-            webResponse.headers.forEach((value, key) => {
-                const lowerKey = key.toLowerCase();
-                if (lowerKey === 'content-encoding' || lowerKey === 'content-length') return;
-                res.setHeader(key, value);
-            });
+      // (防止 Node.js 自动解压后，Header 仍残留 Gzip 标识导致客户端解析乱码)
+      webResponse.headers.forEach((value, key) => {
+          const lowerKey = key.toLowerCase();
+          if (lowerKey === 'content-encoding' || lowerKey === 'content-length') return;
+          res.setHeader(key, value);
+      });
 
-            // [优化] GZIP 出口压缩策略
-            // 触发条件：客户端支持 + 文本类型(XML/JSON) + 体积 > 1KB
-            // 目的：在节省流量与 CPU 开销之间取得平衡，避免负优化小文件
-            const acceptEncoding = req.headers['accept-encoding'] || '';
-            const contentType = webResponse.headers.get('content-type') || '';
+      // [优化] GZIP 出口压缩策略
+      // 触发条件：客户端支持 + 文本类型(XML/JSON) + 体积 > 1KB
+      // 目的：在节省流量与 CPU 开销之间取得平衡，避免负优化小文件
+      const acceptEncoding = req.headers['accept-encoding'] || '';
+      const contentType = webResponse.headers.get('content-type') || '';
 
-            const responseData = await webResponse.arrayBuffer();
-            let buffer = Buffer.from(responseData);
+      const responseData = await webResponse.arrayBuffer();
+      let buffer = Buffer.from(responseData);
 
-            if (acceptEncoding.includes('gzip') && buffer.length > 1024 &&
-                (contentType.includes('xml') || contentType.includes('json') || contentType.includes('text'))) {
-                try {
-                    const compressed = zlib.gzipSync(buffer);
-                    res.setHeader('Content-Encoding', 'gzip');
-                    res.setHeader('Content-Length', compressed.length); // 更新为压缩后的大小
-                    buffer = compressed;
-                } catch (error) {
-                    console.error('[GZIP] Compression failed, falling back to raw:', error.message);
-                }
-            }
+      if (acceptEncoding.includes('gzip') && buffer.length > 1024 &&
+          (contentType.includes('xml') || contentType.includes('json') || contentType.includes('text'))) {
+          try {
+              const compressed = zlib.gzipSync(buffer);
+              res.setHeader('Content-Encoding', 'gzip');
+              res.setHeader('Content-Length', compressed.length); // 更新为压缩后的大小
+              buffer = compressed;
+          } catch (error) {
+              console.error('[GZIP] Compression failed, falling back to raw:', error.message);
+          }
+      }
 
-            //  兜底处理：如果最终未压缩，必须补发原始数据的 Content-Length
-            if (!res.hasHeader('Content-Length')) {
-                res.setHeader('Content-Length', buffer.length);
-            }
+      // 兜底处理：如果最终未压缩，必须补发原始数据的 Content-Length
+      if (!res.hasHeader('Content-Length')) {
+          res.setHeader('Content-Length', buffer.length);
+      }
 
-            // 发送响应数据
-            res.end(buffer);
+      // 发送响应数据
+      res.end(buffer);
     } catch (error) {
       console.error('Server error:', error);
       res.statusCode = 500;
@@ -376,10 +407,15 @@ function createServer() {
   });
 }
 
-// 代理服务器逻辑（用于5321端口）
+/**
+ * 创建代理服务器 (端口 5321)
+ * 处理通用代理请求，支持配置正向代理和请求熔断
+ */
 function createProxyServer() {
   return http.createServer((req, res) => {
-    const queryObject = url.parse(req.url, true).query;
+    // 使用 new URL 解析参数，逻辑与 url.parse 保持一致
+    const reqUrlObj = new URL(req.url, `http://${req.headers.host}`);
+    const queryObject = Object.fromEntries(reqUrlObj.searchParams);
 
     if (queryObject.url) {
       // 解析 PROXY_URL 配置（统一处理代理和反向代理）
@@ -395,9 +431,9 @@ function createProxyServer() {
           if (/^@/.test(config) || /^[\w-]+@http/i.test(config)) {
             continue;
           }
-          // 正向代理：http://proxy.com:port 或 socks5://proxy.com:port
+          // 正向代理：http://proxy.com:port 或 https://proxy.com:port
           forwardProxy = config.trim();
-          console.log('[Proxy Server] Forward proxy detected:', forwardProxy);
+          console.log('[Proxy Server] Forward proxy detected');
           // 找到第一个有效代理就停止，避免逻辑混乱
           break; 
         }
@@ -410,9 +446,10 @@ function createProxyServer() {
         hostname: originalUrlObj.hostname,
         port: originalUrlObj.port || (originalUrlObj.protocol === 'https:' ? 443 : 80),
         path: originalUrlObj.pathname + originalUrlObj.search,
-        method: 'GET',
+        method: req.method,
         headers: { ...req.headers } // 传递原始请求头
       };
+      
       // Host 头必须被移除，以便 protocol.request 根据 options.hostname 设置正确的值
       delete options.headers.host; 
       
@@ -421,7 +458,7 @@ function createProxyServer() {
       // 处理正向代理逻辑
       if (forwardProxy) {
         // 正向代理模式：使用 HttpsProxyAgent
-        console.log('[Proxy Server] Using forward proxy agent:', forwardProxy);
+        console.log('[Proxy Server] Using forward proxy agent');
         options.agent = new HttpsProxyAgent(forwardProxy);
       } else {
         // 直连模式
@@ -433,9 +470,8 @@ function createProxyServer() {
         proxyRes.pipe(res, { end: true });
       });
 
-      // 监听外部触发中断
-      // 当外部触发 abort() 时，这里的 req 会触发 'close'掐断 proxyReq
-      req.on('close', () => {
+      // 客户端响应连接断开时中断上游；请求体读完也会触发 req.close，不能据此取消 POST。
+      res.on('close', () => {
         if (!res.writableEnded) {
           console.log('[Proxy Server] Client disconnected prematurely. Destroying upstream request.');
           proxyReq.destroy();
@@ -443,8 +479,8 @@ function createProxyServer() {
       });
 
       proxyReq.on('error', (err) => {
-        // 过滤掉因外部主动断开导致的 ECONNRESET / socket hang up 错误
-        if (req.destroyed || req.aborted || err.code === 'ECONNRESET' || err.message === 'socket hang up') {
+        // 仅忽略客户端主动断开，正常请求的上游错误仍需返回响应。
+        if (res.destroyed || req.aborted) {
             // 只有当响应还没结束时，才打印一条 Info 级别的日志，证明熔断成功
             if (!res.writableEnded) {
                 console.log('[Proxy Server] Upstream connection closed (expected behavior due to client interrupt).');
@@ -459,7 +495,7 @@ function createProxyServer() {
         }
       });
 
-      proxyReq.end();
+      req.pipe(proxyReq);
     } else {
       res.statusCode = 400;
       res.end('Bad Request: Missing URL parameter');
@@ -467,65 +503,68 @@ function createProxyServer() {
   });
 }
 
-
-// --- 启动函数 ---
-// 同步启动（最优/默认路径，适用于常规已兼容环境）
-function startServerSync() {
-  console.log('[server] Starting server synchronously (optimal path)');
+/**
+ * 启动服务器
+ * 启动主业务服务器和代理服务器
+ */
+async function startServer() {
+  console.log('[server] Starting server...');
 
   // 设置 .env 文件监听
-  setupEnvWatcher();
+  await setupEnvWatcher();
 
-  // 启动主业务服务器 (9321)
+  // 初始化全局变量环境
+  try {
+    Globals.init(process.env);
+  } catch (e) {
+    console.error('[server] Globals init failed:', e);
+  }
+
+  // 启动主业务服务器（默认 9321，可通过 DANMU_API_PORT 覆盖）
+  const configuredMainPort = Number.parseInt(process.env.DANMU_API_PORT ?? '', 10);
+  const mainPort = Number.isNaN(configuredMainPort) ? 9321 : configuredMainPort;
   mainServer = createServer();
-  mainServer.listen(9321, '0.0.0.0', () => {
-    console.log('Server running on http://0.0.0.0:9321');
+  const mainBinding = await listenOnAllInterfaces(mainServer, mainPort, {
+    serviceName: 'main server'
   });
+  console.log(`Server running on http://${formatHostForUrl(mainBinding.address)}:${mainBinding.port}`);
+  if (detectNodeDeployPlatform() === 'node') {
+    initializeNodeServices(mainPort).catch(error => {
+      console.error('[server] Node background services initialization failed:', error.message);
+    });
+  }
 
   // 启动5321端口的代理服务
   proxyServer = createProxyServer();
-  proxyServer.listen(5321, '0.0.0.0', () => {
-    console.log('Proxy server running on http://0.0.0.0:5321');
+  const proxyBinding = await listenOnAllInterfaces(proxyServer, 5321, {
+    serviceName: 'proxy server'
   });
+  console.log(`Proxy server running on http://${formatHostForUrl(proxyBinding.address)}:${proxyBinding.port}`);
+
+  // 异步初始化 Bangumi Data 缓存
+  setTimeout(() => initBangumiData('node', true).catch(console.error), 1000);
 }
 
-// 异步启动（兼容层模式路径，适用于 Node.js < v20.19.0 + node-fetch v3）
-async function startServerAsync() {
-  try {
-    console.log('[server] Starting server asynchronously (compatibility mode for Node.js <20.19.0 + node-fetch v3)');
-
-    // 设置 .env 文件监听
-    setupEnvWatcher();
-
-    // 预加载 node-fetch v3（解决特定环境下 node-fetch v3 的加载问题）
-    if (typeof global.loadNodeFetch === 'function') {
-      console.log('[server] Pre-loading node-fetch v3...');
-      await global.loadNodeFetch();
-      console.log('[server] node-fetch v3 loaded successfully');
-    }
-
-    // 启动主业务服务器 (9321)
-    mainServer = createServer();
-    mainServer.listen(9321, '0.0.0.0', () => {
-      console.log('Server running on http://0.0.0.0:9321 (compatibility mode)');
-    });
-
-    // 启动5321端口的代理服务
-    proxyServer = createProxyServer();
-    proxyServer.listen(5321, '0.0.0.0', () => {
-      console.log('Proxy server running on http://0.0.0.0:5321 (compatibility mode)');
-    });
-
-  } catch (error) {
-    console.error('[server] Failed to start server:', error);
-    process.exit(1);
-  }
+async function initializeNodeServices(mainPort) {
+  Globals.deployPlatform = 'node';
+  await ensureRemoteTitleMapping();
+  await initializeFavoriteScheduler(mainPort);
 }
 
-// --- 启动决策逻辑 ---
-// 智能选择启动方式：如果环境需要兼容，则异步启动；否则同步启动。
-if (needsAsyncStartup()) {
-  startServerAsync();
-} else {
-  startServerSync();
+async function initializeFavoriteScheduler(mainPort) {
+  await judgeRedisValid('/api/v2/favorite/list');
+  await initializePersistentCaches('node');
+
+  const refreshUrl = new URL(`http://127.0.0.1:${mainPort}/api/v2/favorite/refresh`);
+  await startFavoriteScheduler({
+    refresh: keyword => refreshFavoriteByKeyword(keyword, refreshUrl, { persist: false }),
+    persist: persistFavorites
+  });
+  console.log('[server] Favorite scheduler started (Node/Docker only, Asia/Shanghai)');
 }
+
+// 启动
+startServer().catch(error => {
+  console.error('[server] Failed to start server:', error);
+  cleanupWatcher(1);
+});

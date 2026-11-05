@@ -2,7 +2,7 @@ import BaseSource from './base.js';
 import { globals } from '../configs/globals.js';
 import { log } from "../utils/log-util.js";
 import { buildQueryString, httpGet, httpPost } from "../utils/http-util.js";
-import { printFirst200Chars, titleMatches } from "../utils/common-util.js";
+import { printFirst200Chars, titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { md5, convertToAsciiSum } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
@@ -11,7 +11,51 @@ import { SegmentListResponse } from '../models/dandan-model.js';
 // =====================
 // 获取优酷弹幕
 // =====================
+
+/**
+ * 生成本地兜底 cna。
+ * 优酷弹幕接口只把 cna 当作请求体里的客户端标识（guid）回传，不校验其来源，
+ * mmstat 域名被广告过滤/私人 DNS 拦截时可用本地生成值代替（详见 getEpisodeDanmuSegments）。
+ */
+function generateLocalCna() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = new Uint8Array(24);
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  let cna = '';
+  for (const byte of bytes) {
+    cna += chars[byte % chars.length];
+  }
+  return cna;
+}
+
 export default class YoukuSource extends BaseSource {
+  constructor() {
+    super();
+    // mmstat 取 cna 失败后置为 true，后续请求直接复用本地 cna，避免每次都等待失败请求超时
+    this._useFallbackCna = false;
+    this._fallbackCna = null;
+  }
+
+  _getFallbackCna() {
+    if (!this._fallbackCna) {
+      this._fallbackCna = generateLocalCna();
+    }
+    return this._fallbackCna;
+  }
+
+  _emptySegmentList() {
+    return new SegmentListResponse({
+      "type": "youku",
+      "segmentList": []
+    });
+  }
+
   convertYoukuUrl(url) {
     // 使用正则表达式提取 vid 参数
     const vidMatch = url.match(/vid=([^&]+)/);
@@ -96,7 +140,7 @@ export default class YoukuSource extends BaseSource {
 
   async search(keyword) {
     try {
-      log("info", `[Youku] 开始搜索: ${keyword}`);
+      log("info", `[youku] 开始搜索: ${keyword}`);
 
       const encodedKeyword = encodeURIComponent(keyword);
       const encodedUA = encodeURIComponent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
@@ -111,14 +155,14 @@ export default class YoukuSource extends BaseSource {
       });
 
       if (!response || !response.data) {
-        log("info", "[Youku] 搜索响应为空");
+        log("info", "[youku] 搜索响应为空");
         return [];
       }
 
       const data = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
 
       if (!data.pageComponentList) {
-        log("info", "[Youku] 搜索无结果");
+        log("info", "[youku] 搜索无结果");
         return [];
       }
 
@@ -131,25 +175,25 @@ export default class YoukuSource extends BaseSource {
         }
       }
 
-      log("info", `[Youku] 搜索找到 ${results.length} 个有效结果`);
+      log("info", `[youku] 搜索找到 ${results.length} 个有效结果`);
       return results;
 
     } catch (error) {
-      log("error", "[Youku] 搜索出错:", error.message);
+      log("error", "[youku] 搜索出错:", error.message);
       return [];
     }
   }
 
   async getEpisodes(id) {
     try {
-      log("info", `[Youku] 获取分集列表: show_id=${id}`);
+      log("info", `[youku] 获取分集列表: show_id=${id}`);
 
       // 第一步：获取第一页以确定总数
       const pageSize = 100;
       const firstPage = await this._getEpisodesPage(id, 1, pageSize);
 
       if (!firstPage || !firstPage.videos || firstPage.videos.length === 0) {
-        log("info", "[Youku] 未找到分集信息");
+        log("info", "[youku] 未找到分集信息");
         return [];
       }
 
@@ -159,7 +203,7 @@ export default class YoukuSource extends BaseSource {
       // 第二步：如果有多页，并发获取剩余页面
       if (totalCount > pageSize) {
         const totalPages = Math.ceil(totalCount / pageSize);
-        log("info", `[Youku] 检测到 ${totalCount} 个分集，将并发请求 ${totalPages} 页`);
+        log("info", `[youku] 检测到 ${totalCount} 个分集，将并发请求 ${totalPages} 页`);
 
         const pagePromises = [];
         for (let page = 2; page <= totalPages; page++) {
@@ -172,18 +216,18 @@ export default class YoukuSource extends BaseSource {
           if (result.status === 'fulfilled' && result.value && result.value.videos) {
             allEpisodes.push(...result.value.videos);
           } else if (result.status === 'rejected') {
-            log("error", `[Youku] 获取分集页面 ${i + 2} 失败:`, result.reason);
+            log("error", `[youku] 获取分集页面 ${i + 2} 失败:`, result.reason);
           }
         }
 
-        log("info", `[Youku] 并发获取完成，共获取 ${allEpisodes.length} 个分集`);
+        log("info", `[youku] 并发获取完成，共获取 ${allEpisodes.length} 个分集`);
       }
 
-      log("info", `[Youku] 共获取 ${allEpisodes.length} 集`);
+      log("info", `[youku] 共获取 ${allEpisodes.length} 集`);
       return allEpisodes;
 
     } catch (error) {
-      log("error", "[Youku] 获取分集出错:", error.message);
+      log("error", "[youku] 获取分集出错:", error.message);
       return [];
     }
   }
@@ -205,18 +249,44 @@ export default class YoukuSource extends BaseSource {
     return data;
   }
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map|null} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
     if (!sourceAnimes || !Array.isArray(sourceAnimes)) {
-      log("error", "[Youku] sourceAnimes is not a valid array");
+      log("error", "[youku] sourceAnimes is not a valid array");
       return [];
     }
 
-    const processYoukuAnimes = await Promise.all(sourceAnimes
-      .filter(s => titleMatches(s.title, queryTitle))
-      .map(async (anime) => {
+    // 基础标题与季度匹配过滤
+    let filteredAnimes = sourceAnimes.filter(s => titleMatches(s.title, queryTitle, querySeason));
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const s = extractSeasonNumberFromAnimeTitle(anime.title).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[youku] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
+    const processYoukuAnimes = await Promise.all(filteredAnimes.map(async (anime) => {
         try {
           const eps = await this.getEpisodes(anime.mediaId);
 
@@ -253,12 +323,12 @@ export default class YoukuSource extends BaseSource {
             };
 
             tmpAnimes.push(transformedAnime);
-            addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links}, detailStore);
 
             if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
           }
         } catch (error) {
-          log("error", `[Youku] Error processing anime: ${error.message}`);
+          log("error", `[youku] Error processing anime: ${error.message}`);
         }
       })
     );
@@ -365,7 +435,7 @@ export default class YoukuSource extends BaseSource {
   }
 
    async getEpisodeDanmu(id) {
-    log("info", "开始从本地请求优酷弹幕...", id);
+    log("info", "[youku] 开始从本地请求优酷弹幕...", id);
 
     if (!id) {
       return [];
@@ -373,12 +443,17 @@ export default class YoukuSource extends BaseSource {
 
     // 获取分片URL列表
     const segmentListResponse = await this.getEpisodeDanmuSegments(id);
-    const segmentList = segmentListResponse.segmentList;
+    const segmentList = segmentListResponse?.segmentList ?? [];
+
+    if (segmentList.length === 0) {
+      log("info", "[youku] 未获取到弹幕分片，返回空结果");
+      return [];
+    }
 
     let contents = [];
 
     // 并发限制（可通过环境变量 YOUKU_CONCURRENCY 配置，默认 8）
-    const concurrency = globals.youkuConcurrency;
+    const concurrency = Math.max(1, Number(globals.youkuConcurrency) || 8);
     const segments = [...segmentList];
 
     for (let i = 0; i < segments.length; i += concurrency) {
@@ -412,7 +487,7 @@ export default class YoukuSource extends BaseSource {
           }
         }
       } catch (e) {
-        log("error", "优酷分段批量请求失败:", e.message);
+        log("error", "[youku] 优酷分段批量请求失败:", e.message);
       }
     }
 
@@ -422,19 +497,21 @@ export default class YoukuSource extends BaseSource {
   }
 
   async getEpisodeDanmuSegments(id) {
-    log("info", "获取优酷弹幕分段列表...", id);
+    log("info", "[youku] 获取优酷弹幕分段列表...", id);
 
     if (!id) {
-      return new SegmentListResponse({
-        "type": "youku",
-        "segmentList": []
-      });
+      return this._emptySegmentList();
     }
 
     // 处理302场景
     // https://v.youku.com/video?vid=XNjQ4MTIwOTE2NA==&tpa=dW5pb25faWQ9MTAyMjEzXzEwMDAwNl8wMV8wMQ需要转成https://v.youku.com/v_show/id_XNjQ4MTIwOTE2NA==.html
     if (id.includes("youku.com/video?vid")) {
         id = this.convertYoukuUrl(id);
+    }
+
+    if (!id) {
+      log("error", "[youku] Invalid URL");
+      return this._emptySegmentList();
     }
 
     // 弹幕和视频信息 API 基础地址
@@ -449,14 +526,14 @@ export default class YoukuSource extends BaseSource {
     if (match) {
       path = match[2].split('/').filter(Boolean);  // 分割路径并去掉空字符串
       path.unshift("");
-      log("info", path);
+      log("info", "[youku]", path);
     } else {
-      log("error", 'Invalid URL');
-      return [];
+      log("error", "[youku] Invalid URL");
+      return this._emptySegmentList();
     }
     const video_id = path[path.length - 1].split(".")[0].slice(3);
 
-    log("info", `video_id: ${video_id}`);
+    log("info", `[youku] video_id: ${video_id}`);
 
     // 获取页面标题和视频时长
     let res;
@@ -470,36 +547,62 @@ export default class YoukuSource extends BaseSource {
         allow_redirects: false
       });
     } catch (error) {
-      log("error", "请求视频信息失败:", error);
-      return [];
+      log("error", "[youku] 请求视频信息失败:", error);
+      return this._emptySegmentList();
     }
 
-    const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
-    const title = data.title;
-    const duration = data.duration;
-    log("info", `标题: ${title}, 时长: ${duration}`);
-
-    // 获取 cna 和 tk_enc
-    let cna, _m_h5_tk_enc, _m_h5_tk;
+    let data;
     try {
-      const cnaUrl = "https://log.mmstat.com/eg.js";
-      const tkEncUrl = "https://acs.youku.com/h5/mtop.com.youku.aplatform.weakget/1.0/?jsv=2.5.1&appKey=24679788";
-      const cnaRes = await httpGet(cnaUrl, {
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
-        },
-        allow_redirects: false
-      });
-      log("info", `cnaRes: ${JSON.stringify(cnaRes)}`);
-      log("info", `cnaRes.headers: ${JSON.stringify(cnaRes.headers)}`);
-      const etag = cnaRes.headers["etag"] || cnaRes.headers["Etag"];
-      log("info", `etag: ${etag}`);
-      // const match = cnaRes.headers["set-cookie"].match(/cna=([^;]+)/);
-      // cna = match ? match[1] : null;
-      cna = etag.replace(/^"|"$/g, '');
-      log("info", `cna: ${cna}`);
+      data = typeof res?.data === "string" ? JSON.parse(res.data) : res?.data;
+    } catch (error) {
+      log("error", "[youku] 视频信息解析失败:", error.message);
+      return this._emptySegmentList();
+    }
+    if (!data) {
+      log("error", "[youku] 视频信息为空");
+      return this._emptySegmentList();
+    }
+    const title = data.title;
+    const duration = Number(data.duration);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      log("error", `[youku] 视频时长无效: ${data.duration}`);
+      return this._emptySegmentList();
+    }
+    log("info", `[youku] 标题: ${title}, 时长: ${duration}`);
 
+    // 获取 cna：mmstat 域名常被广告过滤/私人 DNS 拦截，
+    // 首次失败后改用本地生成的等价格式 cna 兜底，之后不再请求该域名
+    let cna = null;
+    let _m_h5_tk_enc = null, _m_h5_tk = null;
+    if (this._useFallbackCna) {
+      cna = this._getFallbackCna();
+    } else {
+      try {
+        const cnaUrl = "https://log.mmstat.com/eg.js";
+        const cnaRes = await httpGet(cnaUrl, {
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
+          },
+          allow_redirects: false
+        });
+        const etag = cnaRes?.headers?.["etag"] || cnaRes?.headers?.["Etag"];
+        if (typeof etag === "string" && etag.trim()) {
+          cna = etag.replace(/^"|"$/g, '');
+        }
+      } catch (error) {
+        log("info", `[youku] 获取 cna 失败，切换本地生成值兜底: ${error.message}`);
+      }
+      if (!cna) {
+        this._useFallbackCna = true;
+        cna = this._getFallbackCna();
+        log("info", `[youku] 使用本地生成 cna 兜底: ${cna}`);
+      }
+    }
+
+    // 获取 tk_enc / _m_h5_tk（mtop 签名 token 由服务端下发，无法本地生成）
+    try {
+      const tkEncUrl = "https://acs.youku.com/h5/mtop.com.youku.aplatform.weakget/1.0/?jsv=2.5.1&appKey=24679788";
       let tkEncRes;
       while (!tkEncRes) {
         tkEncRes = await httpGet(tkEncUrl, {
@@ -510,10 +613,7 @@ export default class YoukuSource extends BaseSource {
           allow_redirects: false
         });
       }
-      log("info", `tkEncRes: ${JSON.stringify(tkEncRes)}`);
-      log("info", `tkEncRes.headers: ${JSON.stringify(tkEncRes.headers)}`);
-      const tkEncSetCookie = tkEncRes.headers["set-cookie"] || tkEncRes.headers["Set-Cookie"];
-      log("info", `tkEncSetCookie: ${tkEncSetCookie}`);
+      const tkEncSetCookie = tkEncRes?.headers?.["set-cookie"] || tkEncRes?.headers?.["Set-Cookie"] || "";
 
       // 获取 _m_h5_tk_enc
       const tkEncMatch = tkEncSetCookie.match(/_m_h5_tk_enc=([^;]+)/);
@@ -523,11 +623,16 @@ export default class YoukuSource extends BaseSource {
       const tkH5Match = tkEncSetCookie.match(/_m_h5_tk=([^;]+)/);
       _m_h5_tk = tkH5Match ? tkH5Match[1] : null;
 
-      log("info", `_m_h5_tk_enc: ${_m_h5_tk_enc}`);
-      log("info", `_m_h5_tk: ${_m_h5_tk}`);
+      log("info", `[youku] _m_h5_tk_enc: ${_m_h5_tk_enc}`);
+      log("info", `[youku] _m_h5_tk: ${_m_h5_tk}`);
     } catch (error) {
-      log("error", "获取 cna 或 tk_enc 失败:", error);
-      return [];
+      log("error", "[youku] 获取 tk_enc 失败:", error);
+      return this._emptySegmentList();
+    }
+
+    if (!_m_h5_tk || !_m_h5_tk_enc) {
+      log("error", "[youku] 未获取到有效的 mtop token，跳过弹幕请求");
+      return this._emptySegmentList();
     }
 
     // 计算弹幕分段请求
@@ -608,7 +713,7 @@ export default class YoukuSource extends BaseSource {
 
       const queryString = buildQueryString(params);
       const url = `${api_danmaku}?${queryString}`;
-      log("info", `piece_url: ${url}`);
+      log("info", `[youku] piece_url: ${url}`);
 
       return {
         "type": "youku",
@@ -634,7 +739,7 @@ export default class YoukuSource extends BaseSource {
   }
 
   async getEpisodeSegmentDanmu(segment) {
-    log("info", "开始从本地请求优酷分段弹幕...", segment.url);
+    log("info", "[youku] 开始从本地请求优酷分段弹幕...", segment.url);
 
     const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), {
       headers: {
@@ -669,8 +774,13 @@ export default class YoukuSource extends BaseSource {
         uid: 0,
         content: "",
       };
-      content.timepoint = item.playat / 1000;
-      const prop = JSON.parse(item.propertis)
+      content.timepoint = Number(item.playat) / 1000 || 0;
+      let prop = null;
+      try {
+        prop = item.propertis ? JSON.parse(item.propertis) : null;
+      } catch (error) {
+        log("info", `[youku] 弹幕属性解析失败，已忽略颜色/位置: ${error.message}`);
+      }
       if (prop?.color) {
         content.color = typeof prop.color === 'string' 
           ? parseInt(prop.color, 10) 
@@ -682,6 +792,7 @@ export default class YoukuSource extends BaseSource {
         else if (pos === 2) content.ct = 4;
       }
       content.content = item.content;
+      content.like = item.extFields?.voteUp ?? 0;
       return content;
     });
   }

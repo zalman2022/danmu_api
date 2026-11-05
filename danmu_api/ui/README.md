@@ -6,16 +6,18 @@
 - [功能详解](#功能详解)
   - [1. 配置预览](#1-配置预览)
   - [2. 日志查看](#2-日志查看)
-  - [3. 接口调试](#3-接口调试)
+  - [3. 接口调试/弹幕测试](#3-接口调试弹幕测试)
   - [4. 推送弹幕](#4-推送弹幕)
-  - [5. 系统配置](#5-系统配置)
+  - [5. 请求记录](#5-请求记录)
+  - [6. 本地弹幕](#6-本地弹幕)
+  - [7. 系统配置](#7-系统配置)
 - [安全说明](#安全说明)
 - [部署平台支持](#部署平台支持)
 - [部署平台环境变量配置指南](#部署平台环境变量配置指南)
   - [各平台变量获取详细步骤](#各平台变量获取详细步骤)
     - [1. Vercel 平台](#1-vercel-平台)
     - [2. Netlify 平台](#2-netlify-平台)
-    - [3. EdgeOne (腾讯云 Pages) 平台](#3-edgeone-腾讯云-pages-平台)
+    - [3. EdgeOne Makers 平台](#3-edgeone-makers-平台)
     - [4. Cloudflare 平台](#4-cloudflare-平台)
   - [常见问题](#常见问题)
 - [API 端点](#api-端点)
@@ -31,9 +33,11 @@ UI 系统提供了以下主要功能模块：
 
 1. **配置预览** - 查看当前生效的环境变量配置
 2. **日志查看** - 实时查看系统运行日志
-3. **接口调试** - 测试和调试 API 接口
+3. **接口调试/弹幕测试** - 测试和调试弹幕 API 接口
 4. **推送弹幕** - 向播放器推送弹幕
-5. **系统配置** - 环境变量配置和系统管理
+5. **请求记录** - 查看最近的 API 请求记录
+6. **本地弹幕** - 上传、解析和管理本地弹幕文件
+7. **系统配置** - 环境变量配置和系统管理
 
 ## 访问方式
 
@@ -60,7 +64,7 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 - 刷新日志功能
 - 清空日志功能（需要 ADMIN_TOKEN）
 
-### 3. 接口调试
+### 3. 接口调试/弹幕测试
 
 接口调试功能允许您：
 
@@ -74,6 +78,17 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
   - 获取番剧详情 - `/api/v2/bangumi/:animeId`
   - 获取弹幕 - `/api/v2/comment/:commentId`
 
+弹幕测试功能允许您：
+
+- 自动匹配测试：输入文件名自动匹配并获取弹幕，模拟播放器自动加载流程
+- 手动匹配测试：搜索动漫 → 选择番剧 → 选择剧集 → 获取弹幕
+- 弹幕统计：弹幕数、时长、高能时刻、平均密度、匹配时长、类型分布
+- 弹幕热力图：按时间段可视化弹幕密度分布
+- 弹幕列表：支持全部/滚动/顶部/底部过滤，显示颜色和类型标签，首次加载及每次加载更多500条
+- 导出功能：支持导出JSON和XML格式弹幕文件
+- 时长处理：优先请求 `/api/v2/comment/:commentId?format=json&duration=true` 返回的 `videoDuration`，没有真实时长时再回退到尾部裁剪算法
+- 视图导航优化：搜索结果/剧集详情/弹幕详情逐级切换，带返回按钮和加载动画
+
 ### 4. 推送弹幕
 
 推送弹幕功能支持：
@@ -83,7 +98,35 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 - 推送地址格式如：`http://127.0.0.1:9978/action?do=refresh&type=danmaku&path=`
 - 需要在同一局域网或使用公网 IP
 
-### 5. 系统配置
+
+### 5. 请求记录
+
+请求记录页面提供：
+
+- 查看最近一段时间内的 API 请求历史
+- 显示每条请求的详细信息，包括：
+  - 请求时间
+  - 请求方法 (GET, POST, etc.)
+  - 请求 URL
+  - 请求参数
+  - 请求来源 IP
+- 查看今日请求总数
+
+### 6. 本地弹幕
+
+本地弹幕页面用于将本地弹幕文件导入服务，并在搜索和自动匹配中使用。页面支持 XML、JSON、ASS、SSA、CSV、TXT 格式，单个文件大小上限为 10 MB。
+
+上传时需要填写标题、年份和类型（`tv` 或 `movie`）。电视剧默认第 1 季第 1 集，也可以指定季数和集数；电影的季数和集数可以留空。标题、年份、类型和季相同的资源会归为一组，列表支持按标题关键词搜索，可编辑剧集信息（标题、年份、类型、季）或单集信息（集数、显示文件名），编辑只更新元数据，不重新解析弹幕；也可展开查看每一集并单独删除文件、重新上传文件，或一次删除整个剧集。编辑目标与已有资源冲突时会拒绝保存。重新上传同一季同一集会替换原文件。
+
+同一部电视剧的多集可以一次多选导入，共用标题、年份和季。选择多个文件后，页面会按文件名排序并显示预览，自动识别 `S01E02`、`EP02`、`第02集`、`02.xml` 等文件名中的集数；每个文件的集数都可以修改，未识别或重复的集数需要先修正才能上传。批量导入仅用于 `tv`，电影仍逐个导入。
+
+点击“批量上传并解析”后，页面逐个上传文件，显示每个文件的结果和整批统计。单个文件超过 10 MB 或上传失败时会继续处理其余文件，成功后统一刷新资源列表。批量导入由页面依次调用现有上传接口完成，接口每次仍只接收一个 `file`。
+
+本地弹幕页面和接口需要有效的 `TOKEN` 或 `ADMIN_TOKEN`。默认只有 `ADMIN_TOKEN` 可以上传和删除，普通 `TOKEN` 只能查看列表；设置 `LOCAL_DANMU_NOT_REQUIRE_ADMIN=true` 后，普通 `TOKEN` 也可以上传和删除。资源保存方式取决于部署环境：Node/Docker 保存到 `.cache/local-danmu`，云端部署使用已配置的 Redis。
+
+导入完成后，需要在 `SOURCE_ORDER` 中加入 `local`，例如 `SOURCE_ORDER=local,douban,360`，搜索接口才会检索并返回本地弹幕。`local` 是数据源，不属于 `PLATFORM_ORDER` 的播放平台选项。
+
+### 7. 系统配置
 
 系统配置页面包含：
 
@@ -110,6 +153,7 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 
 - 访问 UI 系统需要在 URL 中配置 TOKEN
 - 系统管理功能（日志查看、环境变量配置等）需要 ADMIN_TOKEN
+- 本地弹幕上传和删除默认需要 ADMIN_TOKEN；可通过 `LOCAL_DANMU_NOT_REQUIRE_ADMIN=true` 放宽为普通 TOKEN
 - 确保 TOKEN 和 ADMIN_TOKEN 的安全性
 
 ## 部署平台支持
@@ -121,7 +165,7 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 - Netlify
 - Cloudflare
 - Docker
-- EdgeOne
+- EdgeOne Makers（原 EdgeOne Pages）
 
 根据部署平台的不同，可能需要配置额外的环境变量。
 
@@ -133,10 +177,35 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 |------|----------------------|----------------------|---------------------|
 | Vercel | ❌ | ✅ | ✅ |
 | Netlify | ✅ | ✅ | ✅ |
-| EdgeOne | ❌ | ✅ | ✅ |
+| EdgeOne Makers | ❌ | ✅ | ✅ |
 | Cloudflare | ✅ | ✅ | ✅ |
+| Hugging Face Spaces | ✅ | ✅ | ✅ |
 | Node.js | ❌ | ❌ | ❌ |
 | Docker | ❌ | ❌ | ❌ |
+
+---
+
+### 5. Hugging Face Spaces 平台
+
+#### 需要的变量
+- `DEPLOY_PLATFROM_ACCOUNT`: Hugging Face 用户名或组织名
+- `DEPLOY_PLATFROM_PROJECT`: Space 名称
+- `DEPLOY_PLATFROM_TOKEN`: User Access Token
+
+#### 获取步骤
+
+**获取 Account 与 Space 名称**
+
+1. 打开你的 Hugging Face Space 页面
+2. Space 地址格式为 `https://huggingface.co/spaces/{account}/{space}`
+3. `{account}` 填入 `DEPLOY_PLATFROM_ACCOUNT`，`{space}` 填入 `DEPLOY_PLATFROM_PROJECT`
+
+**获取 User Access Token (`DEPLOY_PLATFROM_TOKEN`)**
+
+1. 登录 [Hugging Face Access Tokens](https://huggingface.co/settings/tokens)
+2. 创建 Fine-grained token 或 Write token
+3. 如果使用 Fine-grained token，请授予目标 Space 的写入权限
+4. **立即复制并保存** Token(只显示一次)
 
 ---
 
@@ -211,25 +280,40 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 
 ---
 
-### 3. EdgeOne (腾讯云 Pages) 平台
+<a id="3-edgeone-腾讯云-pages-平台"></a>
+
+### 3. EdgeOne Makers 平台
+
+EdgeOne Pages 已更名为 EdgeOne Makers，账号、项目、构建和域名等既有行为保持不变，现有项目无需迁移。[官方更名说明](https://pages.edgeone.ai/zh/resources/announcement-makers-rename)
 
 #### 需要的变量
-- `DEPLOY_PLATFROM_PROJECT`: 项目 ID
-- `DEPLOY_PLATFROM_TOKEN`: API 密钥
+
+- `DEPLOY_PLATFROM_PROJECT`: 控制台显示的完整项目 ID，支持 `pages-...` 和 `makers-...`
+- `DEPLOY_PLATFROM_TOKEN`: 项目所属账号的 API Token
+
+变量名中的 `PLATFROM` 沿用项目既有拼写，请按原样填写。
 
 #### 获取步骤
 
 **获取 Project ID (`DEPLOY_PLATFROM_PROJECT`)**
 
 1. 登录 [腾讯云 EdgeOne 控制台](https://console.cloud.tencent.com/edgeone)
-2. 进入 **Pages** 服务
+2. 进入 **Makers** 服务（旧版控制台名称为 **Pages**）
 3. 选择你的项目
-4. 在URL可以看到项目 ID(格式类似: `pages-xxxxxxxxxxxx`)
+4. 从项目页面 URL 中复制完整项目 ID。旧项目通常为 `pages-xxxxxxxxxxxx`，新版控制台创建的项目通常为 `makers-xxxxxxxxxxxx`，请以控制台实际显示的值为准，不要自行替换前缀。
 
-**获取 API 密钥 (`DEPLOY_PLATFROM_TOKEN`)**
+例如，新项目的实际 ID 为 `makers-xxxxxxxxxxxx` 时，填写：
+
+```env
+DEPLOY_PLATFROM_PROJECT=makers-xxxxxxxxxxxx
+```
+
+本项目会将项目 ID 原样传给平台接口，无需为 `makers-` 前缀修改代码。部署链接和接口地址中的 `pages` 也无需按品牌名称自行替换。
+
+**获取 API Token (`DEPLOY_PLATFROM_TOKEN`)**
 
 1. 登录 [腾讯云 EdgeOne 控制台](https://console.cloud.tencent.com/edgeone)
-2. 进入 **Pages** 服务
+2. 进入 **Makers** 服务（旧版控制台名称为 **Pages**）
 3. 选择 **API Token** 标签页 
 4. 点击 **创建 API Token** 按钮
 5. 输入描述和过期时间，点击提交后复制相应Token
@@ -286,8 +370,19 @@ A: 大多数平台的 Token 只显示一次,如果忘记复制需要删除后重
 
 在 UI 页面顶部显示当前 API 端点，可点击复制到剪贴板。
 
+本地弹幕管理使用以下接口：
+
+- `POST /api/v2/local-danmu/upload`：上传并解析本地弹幕文件，使用 `multipart/form-data`，必填字段为 `file`、`title`、`year`、`type`。
+- `GET /api/v2/local-danmu/list`：获取资源列表和分组信息。
+- `GET /api/v2/local-danmu/:resourceKey`：获取单个资源元数据。
+- `DELETE /api/v2/local-danmu/:resourceKey`：删除单个资源。
+- `PATCH /api/v2/local-danmu/:resourceKey`：编辑资源元数据；`scope=resource` 修改集数和显示文件名，`scope=group` 修改当前季的标题、年份、类型和季数。编辑不会重新解析弹幕内容，目标键冲突时返回 409。
+
+这些接口也支持去掉 `/v2` 的 `/api/local-danmu/...` 路径。上传和删除默认需要 `ADMIN_TOKEN`；设置 `LOCAL_DANMU_NOT_REQUIRE_ADMIN=true` 后，普通 `TOKEN` 也可以执行。
+
 ## 故障排除
 
 - 如果无法访问功能页面，请检查 URL 中的 TOKEN 是否正确
 - 如果系统管理功能不可用，请确认 ADMIN_TOKEN 等环境变量是否已配置
+- 如果本地弹幕列表为空，请确认已在 `SOURCE_ORDER` 中加入 `local`；如果上传或删除返回 403，请使用 `ADMIN_TOKEN` 或启用 `LOCAL_DANMU_NOT_REQUIRE_ADMIN=true`
 - 如遇到其他问题，请查看系统日志获取更多信息
